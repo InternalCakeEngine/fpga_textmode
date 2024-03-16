@@ -1,3 +1,5 @@
+// Text mode generator for VGA.
+
 module top_textmode (
     input  wire logic clk_100m,     // 100 MHz clock
     input  wire logic btn_rst_n,    // reset button
@@ -18,21 +20,62 @@ module top_textmode (
        .clk_pix_5x(),  // not used for VGA output
        .clk_pix_locked
     );
+    
+    // generate system clock
+    logic clk_sys;
+    logic clk_sys_locked;
+    logic rst_sys;
+    clock_sys clock_sys_inst (
+        .clk_100m,
+        .rst(!btn_rst_n),  // reset button is active low
+        .clk_sys,
+        .clk_sys_locked
+    );
+    always_ff @(posedge clk_sys) rst_sys <= !clk_sys_locked;  // wait for clock lock
 
     // display sync signals and coordinates
-    localparam CORDW = 10;  // screen coordinate width in bits
-    logic [CORDW-1:0] sx, sy;
-    logic hsync, vsync, de;
-    simple_480p display_inst (
+    localparam CORDW = 16;  // screen coordinate width in bits
+    logic signed [CORDW-1:0] sx, sy;
+    logic signed hsync, vsync, de;
+    logic newline;
+    logic newframe;
+    display_480p display_inst (
         .clk_pix,
         .rst_pix(!clk_pix_locked),  // wait for clock lock
-        .sx,
-        .sy,
         .hsync,
         .vsync,
-        .de
+        .de,
+        .frame(newframe),
+        .line(newline),
+        .sx,
+        .sy
     );
 
+    // Deal with output latency
+    localparam earlyf = 3;
+    logic signed [CORDW-1:0] fsx;
+    always_comb begin
+        fsx = sx+earlyf;
+    end
+
+    // Transfer newline signal from pixel to system domains.
+    logic newline_sys;
+    xd xd_newline (
+        .clk_src(clk_pix),
+        .clk_dst(clk_sys),
+        .flag_src(newline),
+        .flag_dst(newline_sys)
+    );
+
+    // Transfer newframe signal from pixel to system domains.
+    logic newframe_sys;
+    xd xd_newframe (
+        .clk_src(clk_pix),
+        .clk_dst(clk_sys),
+        .flag_src(newframe),
+        .flag_dst(newframe_sys)
+    );
+    
     // The is 96 8x8 character images (code 32..127).
     localparam PM_IMAGE = "charset.mem";
     localparam PM_CWIDTH = 8;
@@ -45,8 +88,8 @@ module top_textmode (
         .DEPTH(PM_MEXTENT),
         .INIT_F(PM_IMAGE)
     ) bram_pm_inst (
-        .clk_write(clk_pix),
-        .clk_read(clk_pix),
+        .clk_write(clk_sys),
+        .clk_read(clk_sys),
         .we(),
         .addr_write(),
         .addr_read(pm_addr_read),
@@ -66,8 +109,8 @@ module top_textmode (
         .DEPTH(CM_MEXTENT),
         .INIT_F(CM_MESSAGE)
     ) bram_cm_inst (
-        .clk_write(clk_pix),
-        .clk_read(clk_pix),
+        .clk_write(clk_sys),
+        .clk_read(clk_sys),
         .we(),
         .addr_write(),
         .addr_read(cm_addr_read),
@@ -100,56 +143,64 @@ module top_textmode (
         vga_g <= display_g;
         vga_b <= display_b;
     end
-
-
-    logic [7:0] currpix;    // Pixels being streamed out
-    logic [7:0] readypix;   // Pixels ready when currpix runs out
-    logic [CM_CWIDTH-1:0] charaddr;  // Pointer into the characer matrix.
-    logic [7:0] nextchar;   // Character read from character matrix.
-    logic [PM_ADDRW-1:0] pixaddr;   // Address of pixels.
-
+    
+    // Shared linebuffer
+    logic lb_pix_out;
+    logic lb_pix_in;
+    localparam LB_MEXTENT = 640;
+    localparam LB_ADDRW = $clog2(LB_MEXTENT);
+    logic [LB_ADDRW-1:0] lb_write_addr;
+    logic [LB_ADDRW-1:0] write_addr;
+    logic [LB_ADDRW-1:0] lb_read_addr;
+    bram_sdp #(
+        .WIDTH(1),
+        .DEPTH(LB_MEXTENT),
+        .INIT_F("stripes.mem")
+        ) bram_lb (
+        .clk_write(clk_sys),
+        .clk_read(clk_pix),
+        .we(1),
+        .addr_write(lb_write_addr),
+        .addr_read(lb_read_addr),
+        .data_in(lb_pix_in),
+        .data_out(lb_pix_out)
+    );
+    
+    // Read out of the line buffer in pixel clock domain, setting the
+    // address on pixel in advance using fsx instead of sx to trigger.
     always_ff @(posedge clk_pix) begin
-        if( sy<480 && sx<640 ) begin
-            case( sx[2:0] )
-                0: begin
-                    //currpix <= 8'h55;
-                    currpix <= readypix;
-                    cm_addr_read <= charaddr;
-                end
-                1: begin
-                    charaddr <= charaddr+1;
-                    //charaddr = sx[9:3];
-                end
-                2: begin
-                    nextchar <= cm_char_read;
-                    //nextchar <= 32+sx[8:3];
-                end
-                3: begin
-                    pixaddr <= ((nextchar-32)<<3)+sy[3:1];
-                end
-                4: begin
-                    pm_addr_read <= pixaddr;
-                end
-                5: begin
-                    readypix <= pm_pix_read;
-                end
-                default: begin
-                end
+        lb_read_addr <= fsx;
+        pixel <= lb_pix_out;
+    end
+    
+    logic [10:0] line_srcline = 0;
+    
+    logic [7:0] currpix;
+    
+    localparam writefudge=16;
+    enum { CHARREAD, COPYPIX, PIXREAD, W1, W2, W3, W4, W5, W6, W7, W8 } line_copystage, next_copystage;    
+    always_ff @(posedge clk_sys) begin
+        if( write_addr<(640+writefudge) ) begin
+            case( line_copystage )
+                CHARREAD: begin cm_addr_read = (line_srcline[10:4]<<6)+(line_srcline[10:4]<<4)+write_addr[LB_ADDRW-1:3]; line_copystage<=PIXREAD; end
+                PIXREAD: begin pm_addr_read <= {cm_char_read-32,line_srcline[3:1]}; line_copystage<=COPYPIX; end
+                COPYPIX: begin currpix <= pm_pix_read; line_copystage<=W1; end
+                W1: begin lb_write_addr<=write_addr-writefudge; write_addr<=write_addr+1; lb_pix_in <= currpix[7]; line_copystage<=W2; end
+                W2: begin lb_write_addr<=write_addr-writefudge; write_addr<=write_addr+1; lb_pix_in <= currpix[6]; line_copystage<=W3; end
+                W3: begin lb_write_addr<=write_addr-writefudge; write_addr<=write_addr+1; lb_pix_in <= currpix[5]; line_copystage<=W4; end
+                W4: begin lb_write_addr<=write_addr-writefudge; write_addr<=write_addr+1; lb_pix_in <= currpix[4]; line_copystage<=W5; end
+                W5: begin lb_write_addr<=write_addr-writefudge; write_addr<=write_addr+1; lb_pix_in <= currpix[3]; line_copystage<=W6; end
+                W6: begin lb_write_addr<=write_addr-writefudge; write_addr<=write_addr+1; lb_pix_in <= currpix[2]; line_copystage<=W7; end
+                W7: begin lb_write_addr<=write_addr-writefudge; write_addr<=write_addr+1; lb_pix_in <= currpix[1]; line_copystage<=W8; end
+                W8: begin lb_write_addr<=write_addr-writefudge; write_addr<=write_addr+1; lb_pix_in <= currpix[0]; line_copystage<=CHARREAD; end
+                //end
             endcase
-            //if( sx[2:0]==0 ) begin
-            //    pixel <= readypix[7];
-            //end else begin
-                pixel <= currpix[3'd7-sx[2:0]];
-            //end
-        end else begin
-            //if( sy==480 && sx==0 ) begin
-            //    charaddr <= 0;
-            //end
-            if( sy[3:1]!=7 && sy<480 && sx==640 ) begin
-                charaddr <= charaddr-80;
-            end
+        end
+        if( newline_sys && sy>=0 ) begin
+            write_addr <= 0;
+            line_copystage <= CHARREAD;
+            line_srcline <= sy;
         end
     end
-
-
+    
 endmodule
